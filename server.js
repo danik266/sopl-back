@@ -29,7 +29,43 @@ function broadcastToTrack(trackId, payload, exclude = null) {
     }
   });
 }
-
+async function broadcastUserStatus(userId, isOnline) {
+  try {
+    // Находим все чаты, где участвует этот пользователь
+    const chats = await DirectChat.find({ participants: userId });
+    
+    for (const chat of chats) {
+      // Находим собеседника
+      const otherUser = chat.participants.find(p => p.toString() !== userId);
+      if (!otherUser) continue;
+      
+      // Отправляем статус всем подключениям собеседника
+      const otherUserConnections = onlineUsers.get(otherUser.toString());
+      if (otherUserConnections) {
+        const statusPayload = {
+          type: 'user_status',
+          userId: userId,
+          isOnline
+        };
+        
+        // Если пользователь оффлайн, добавляем lastSeen
+        if (!isOnline) {
+          statusPayload.lastSeen = new Date().toISOString();
+        }
+        
+        otherUserConnections.forEach(connection => {
+          if (connection.readyState === WebSocket.OPEN) {
+            connection.send(JSON.stringify(statusPayload));
+          }
+        });
+      }
+    }
+    
+    console.log(`[Status] User ${userId} is now ${isOnline ? 'online' : 'offline'}`);
+  } catch (error) {
+    console.error('[Status] Error broadcasting status:', error);
+  }
+}
 function sendListenersUpdate(trackId) {
   const room = chatRooms.get(trackId);
   const count = room ? room.size : 0;
@@ -2177,7 +2213,16 @@ app.get('/api/admin/stats', authMiddleware, adminMiddleware, async (req, res) =>
 // ============================================
 // 🔥 СПЕЦИАЛЬНЫЙ ЭНДПОИНТ ДЛЯ ПЕРВИЧНОЙ НАСТРОЙКИ
 // ============================================
-
+app.get('/api/users/:id/online-status', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.params.id;
+    const isOnline = onlineUsers.has(userId);
+    
+    res.json({ isOnline });
+  } catch (error) {
+    res.status(500).json({ message: 'Ошибка' });
+  }
+});
 app.get('/api/setup/make-admin', async (req, res) => {
   try {
     const { email } = req.query;
@@ -3164,7 +3209,8 @@ mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/sopl')
     
     // Карта подключений для WebSocket
     const userConnections = new Map(); // userId -> Set<WebSocket>
-
+const onlineUsers = new Map(); // userId -> Set<WebSocket>
+const typingUsers = new Map(); // chatId -> Set<userId>
     // Вспомогательная функция для отправки уведомлений пользователю
     function broadcastToUser(userId, payload) {
       const connections = userConnections.get(userId);
@@ -3174,6 +3220,7 @@ mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/sopl')
       connections.forEach(ws => {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(str);
+          
         }
       });
     }
@@ -3331,90 +3378,126 @@ app.post('/api/debug/fix-user-venue', authMiddleware, async (req, res) => {
       }));
       return;
     }
-          // 1. Авторизация (Auth)
           if (msg.type === 'auth' && msg.token) {
-            try {
-              const decoded = jwt.verify(msg.token, process.env.JWT_SECRET || 'secret_key_change_this');
-              ws.userId = decoded.id;
-              
-              // Добавляем в Map пользовательских подключений
-              if (!userConnections.has(ws.userId)) {
-                userConnections.set(ws.userId, new Set());
-              }
-              userConnections.get(ws.userId).add(ws);
-              
-              ws.send(JSON.stringify({ type: 'auth_success', userId: ws.userId }));
-              console.log(`[WS] User ${ws.userId} authenticated`);
-            } catch (e) {
-              ws.send(JSON.stringify({ type: 'auth_error', message: 'Invalid token' }));
-            }
-            return;
+        try {
+          const decoded = jwt.verify(msg.token, process.env.JWT_SECRET || 'secret_key_change_this');
+          ws.userId = decoded.id;
+          
+          // 🔥 ДОБАВЛЯЕМ В ОНЛАЙН
+          if (!onlineUsers.has(ws.userId)) {
+            onlineUsers.set(ws.userId, new Set());
           }
-
-          // 2. Отправка личного сообщения (Send Message)
-          if (msg.type === 'send_message' && ws.userId) {
-            const { chatId, text } = msg;
-            
-            if (!chatId || !text) {
-              ws.send(JSON.stringify({ type: 'error', message: 'Missing chatId or text' }));
-              return;
+          onlineUsers.get(ws.userId).add(ws);
+          
+          // 🔥 УВЕДОМЛЯЕМ ВСЕ ЧАТЫ ПОЛЬЗОВАТЕЛЯ О СТАТУСЕ "ОНЛАЙН"
+          broadcastUserStatus(ws.userId, true);
+          
+          ws.send(JSON.stringify({ type: 'auth_success', userId: ws.userId }));
+          console.log(`[WS] User ${ws.userId} authenticated and online`);
+        } catch (e) {
+          ws.send(JSON.stringify({ type: 'auth_error', message: 'Invalid token' }));
+        }
+        return;
+      }
+      if (msg.type === 'typing' && ws.userId && msg.chatId) {
+        const chatId = msg.chatId;
+        const isTyping = msg.isTyping;
+        
+        // Находим чат
+        const chat = await DirectChat.findById(chatId);
+        if (!chat || !chat.participants.includes(ws.userId)) {
+          return;
+        }
+        
+        // Находим собеседника
+        const otherUser = chat.participants.find(p => p.toString() !== ws.userId);
+        if (!otherUser) return;
+        
+        // Отправляем статус "печатает" собеседнику
+        const otherUserConnections = onlineUsers.get(otherUser.toString());
+        if (otherUserConnections) {
+          otherUserConnections.forEach(connection => {
+            if (connection.readyState === WebSocket.OPEN) {
+              connection.send(JSON.stringify({ 
+                type: 'user_typing', 
+                userId: ws.userId,
+                chatId,
+                isTyping 
+              }));
             }
+          });
+        }
+        
+        console.log(`[WS] User ${ws.userId} ${isTyping ? 'is typing' : 'stopped typing'} in chat ${chatId}`);
+        return;
+      }
+           if (msg.type === 'send_message' && ws.userId) {
+        const { chatId, text } = msg;
+        
+        if (!chatId || !text) {
+          ws.send(JSON.stringify({ type: 'error', message: 'Missing chatId or text' }));
+          return;
+        }
 
-            const chat = await DirectChat.findById(chatId);
-            if (!chat || !chat.participants.some(p => p._id.toString() === ws.userId)) {
-              ws.send(JSON.stringify({ type: 'error', message: 'Access denied' }));
-              return;
+        const chat = await DirectChat.findById(chatId);
+        if (!chat || !chat.participants.some(p => p.toString() === ws.userId)) {
+          ws.send(JSON.stringify({ type: 'error', message: 'Access denied' }));
+          return;
+        }
+
+        const message = new DirectMessage({
+          chatId,
+          sender: ws.userId,
+          text: text.trim()
+        });
+        await message.save();
+
+        const sender = await User.findById(ws.userId).select('username avatar_url');
+        
+        chat.lastMessage = {
+          text: text.trim(),
+          sender: ws.userId,
+          timestamp: new Date()
+        };
+        chat.updatedAt = new Date();
+
+        const otherUser = chat.participants.find(p => p.toString() !== ws.userId);
+        const currentCount = chat.unreadCount.get(otherUser.toString()) || 0;
+        chat.unreadCount.set(otherUser.toString(), currentCount + 1);
+
+        await chat.save();
+
+        const payload = {
+          _id: message._id,
+          sender: {
+            _id: sender._id,
+            username: sender.username,
+            avatar_url: sender.avatar_url
+          },
+          text: message.text,
+          createdAt: message.createdAt,
+          isOwn: true
+        };
+
+        ws.send(JSON.stringify({ type: 'message_sent', message: payload }));
+
+        // Отправляем получателю
+        const otherUserConnections = onlineUsers.get(otherUser.toString());
+        if (otherUserConnections) {
+          otherUserConnections.forEach(connection => {
+            if (connection.readyState === WebSocket.OPEN) {
+              connection.send(JSON.stringify({
+                type: 'new_message',
+                chatId,
+                message: { ...payload, isOwn: false }
+              }));
             }
+          });
+        }
 
-            const message = new DirectMessage({
-              chatId,
-              sender: ws.userId,
-              text: text.trim()
-            });
-            await message.save();
-
-            const sender = await User.findById(ws.userId).select('username avatar_url');
-            
-            // Обновляем lastMessage
-            chat.lastMessage = {
-              text: text.trim(),
-              sender: ws.userId,
-              timestamp: new Date()
-            };
-            chat.updatedAt = new Date();
-
-            // Увеличиваем unread для получателя
-            const otherUser = chat.participants.find(p => p._id.toString() !== ws.userId);
-            const currentCount = chat.unreadCount.get(otherUser.toString()) || 0;
-            chat.unreadCount.set(otherUser.toString(), currentCount + 1);
-
-            await chat.save();
-
-            const payload = {
-              _id: message._id,
-              sender: {
-                _id: sender._id,
-                username: sender.username,
-                avatar_url: sender.avatar_url
-              },
-              text: message.text,
-              createdAt: message.createdAt,
-              isOwn: true
-            };
-
-            // Отправляем обратно отправителю
-            ws.send(JSON.stringify({ type: 'message_sent', message: payload }));
-
-            // Отправляем получателю
-            broadcastToUser(otherUser.toString(), {
-              type: 'new_message',
-              chatId,
-              message: { ...payload, isOwn: false }
-            });
-
-            console.log(`[WS] Message sent in chat ${chatId}`);
-            return;
-          }
+        console.log(`[WS] Message sent in chat ${chatId}`);
+        return;
+      }
 
           // 3. Подписка на чат трека (Chat Subscribe)
           if (msg.type === 'chat_subscribe' && msg.trackId) {
@@ -3457,7 +3540,32 @@ app.post('/api/debug/fix-user-venue', authMiddleware, async (req, res) => {
             console.log(`[Chat] ${ws.chatUserId || 'anon'} → joined ${trackId} (в комнате: ${chatRooms.get(trackId).size})`);
             return;
           }
-
+ if (msg.type === 'chat_subscribe' && msg.chatId) {
+        ws.chatId = msg.chatId;
+        
+        // Проверяем, имеет ли пользователь доступ к чату
+        if (ws.userId) {
+          const chat = await DirectChat.findById(msg.chatId);
+          if (chat && chat.participants.includes(ws.userId)) {
+            ws.send(JSON.stringify({ type: 'chat_subscribed', chatId: msg.chatId }));
+            console.log(`[WS] User ${ws.userId} subscribed to chat ${msg.chatId}`);
+            
+            // 🔥 ОТПРАВЛЯЕМ СТАТУС СОБЕСЕДНИКА (ОНЛАЙН ИЛИ НЕТ)
+            const otherUser = chat.participants.find(p => p.toString() !== ws.userId);
+            if (otherUser) {
+              const isOnline = onlineUsers.has(otherUser.toString());
+              ws.send(JSON.stringify({ 
+                type: 'user_status', 
+                userId: otherUser.toString(),
+                isOnline 
+              }));
+            }
+          } else {
+            ws.send(JSON.stringify({ type: 'error', message: 'Access denied to this chat' }));
+          }
+        }
+        return;
+      }
           // 4. Сообщение в чат трека (Track Message)
           if (msg.type === 'message' && msg.text && ws.chatTrackId) {
             if (!ws.chatUserId) {
@@ -3499,38 +3607,44 @@ app.post('/api/debug/fix-user-venue', authMiddleware, async (req, res) => {
       }); // Закрываем ws.on('message')
 
       // Обработка отключения
-      ws.on('close', () => {
-        wsClients.delete(ws);
+        ws.on('close', () => {
+    wsClients.delete(ws);
+    
+    // 🔥 УДАЛЯЕМ ИЗ ОНЛАЙН
+    if (ws.userId && onlineUsers.has(ws.userId)) {
+      onlineUsers.get(ws.userId).delete(ws);
+      
+      // Если у пользователя больше нет активных подключений
+      if (onlineUsers.get(ws.userId).size === 0) {
+        onlineUsers.delete(ws.userId);
         
-        // Удаляем из userConnections
-        if (ws.userId && userConnections.has(ws.userId)) {
-           userConnections.get(ws.userId).delete(ws);
-        }
+        // 🔥 УВЕДОМЛЯЕМ ВСЕ ЧАТЫ О СТАТУСЕ "ОФФЛАЙН"
+        broadcastUserStatus(ws.userId, false);
+      }
+    }
 
-        // Удаляем из комнат чатов треков
-        if (ws.chatTrackId) {
-          const room = chatRooms.get(ws.chatTrackId);
-          if (room) {
-            room.delete(ws);
-            if (room.size === 0) chatRooms.delete(ws.chatTrackId);
-            else sendListenersUpdate(ws.chatTrackId);
-          }
-          console.log(`[Chat] ${ws.chatUserId || 'anon'} left ${ws.chatTrackId}`);
-        }
-      });
+    // Удаляем из комнат чатов треков (существующий код)
+    if (ws.chatTrackId) {
+      const room = chatRooms.get(ws.chatTrackId);
+      if (room) {
+        room.delete(ws);
+        if (room.size === 0) chatRooms.delete(ws.chatTrackId);
+        else sendListenersUpdate(ws.chatTrackId);
+      }
+    }
+  });
 
-      ws.on('error', () => {
-        wsClients.delete(ws);
-        if (ws.chatTrackId) {
-          const room = chatRooms.get(ws.chatTrackId);
-          if (room) {
-            room.delete(ws);
-            if (room.size === 0) chatRooms.delete(ws.chatTrackId);
-            else sendListenersUpdate(ws.chatTrackId);
-          }
-        }
-      });
-    }); // Закрываем wss.on('connection')
+  ws.on('error', () => {
+    wsClients.delete(ws);
+    if (ws.userId && onlineUsers.has(ws.userId)) {
+      onlineUsers.get(ws.userId).delete(ws);
+      if (onlineUsers.get(ws.userId).size === 0) {
+        onlineUsers.delete(ws.userId);
+        broadcastUserStatus(ws.userId, false);
+      }
+    }
+  });
+}); // Закрываем wss.on('connection')
 
   }) // Закрываем .then()
   .catch(err => console.log('❌ Ошибка подключения к БД:', err));
