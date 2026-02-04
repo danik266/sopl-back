@@ -1,0 +1,38 @@
+# Зависимости Node.js (их не нужно пушить, они ставятся через npm install)
+node_modules/
+
+# Логи npm (возникают при ошибках)
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Переменные окружения (САМОЕ ВАЖНОЕ: тут пароли от БД и AWS!)
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+
+# Локальные файлы загрузок (если вдруг будешь тестировать загрузку не в S3, а локально)
+uploads/*
+!uploads/.gitkeep
+
+# Файлы настроек редакторов кода
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Системные файлы macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Системные файлы Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Временные файлы
+tmp/
+temp/
