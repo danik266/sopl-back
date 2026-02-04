@@ -11,6 +11,7 @@ const app = express();
 const { S3Client } = require('@aws-sdk/client-s3'); // <--- ДОБАВИЛИ
 const multerS3 = require('multer-s3');
 const { v4: uuidv4 } = require('uuid');
+const axios = require('axios');
 // Настройки
 app.use(express.json());
 app.use(cors());
@@ -81,7 +82,29 @@ function broadcastToVenue(venueId, payload) {
     }
   });
 }
+const sendToTelegram = async (message) => {
+  // 🔥 Берем данные из .env
+  const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+  const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
+  // Если в .env забыли добавить переменные, просто выходим, чтобы сервер не упал
+  if (!TG_TOKEN || !TG_CHAT_ID) {
+    console.warn('⚠️ Telegram уведомления не настроены: проверьте .env');
+    return;
+  }
+
+  try {
+    const url = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
+    await axios.post(url, {
+      chat_id: TG_CHAT_ID,
+      text: message,
+      parse_mode: 'HTML'
+    });
+  } catch (error) {
+    // Логируем ошибку, но не роняем сервер
+    console.error('Ошибка отправки в Telegram:', error.message);
+  }
+};
 const s3 = new S3Client({
   region: process.env.AWS_REGION, // например 'eu-central-1'
   credentials: {
@@ -346,7 +369,9 @@ const adminMiddleware = (req, res, next) => {
 // === АВТОРИЗАЦИЯ ===
 app.post('/api/register', async (req, res) => {
   try {
-    const { username, email, password } = req.body;
+    // 👇 Добавили platform в извлечение данных
+    const { username, email, password, platform } = req.body; 
+    
     const existingUser = await User.findOne({ email });
     if (existingUser) return res.status(400).json({ message: 'Email уже занят' });
 
@@ -355,6 +380,11 @@ app.post('/api/register', async (req, res) => {
 
     const newUser = new User({ username, email, password: hashedPassword });
     await newUser.save();
+
+    // 👇👇👇 ТЕЛЕГРАМ УВЕДОМЛЕНИЕ (ВСТАВИТЬ СЮДА) 👇👇👇
+    const device = platform || 'Неизвестно';
+    sendToTelegram(`🚀 <b>Новая регистрация!</b>\n\n👤 Имя: ${username}\n📧 Email: ${email}\n📱 Устройство: ${device}`);
+    // 👆👆👆
 
     const token = jwt.sign({ id: newUser._id, role: newUser.role }, process.env.JWT_SECRET || 'secret_key_change_this', { expiresIn: '30d' });
     res.status(201).json({ token, user: { id: newUser._id, username, email, role: newUser.role } });
@@ -365,12 +395,19 @@ app.post('/api/register', async (req, res) => {
 
 app.post('/api/login', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    // 👇 Добавили platform
+    const { email, password, platform } = req.body; 
+    
     const user = await User.findOne({ email });
     if (!user) return res.status(400).json({ message: 'Пользователь не найден' });
 
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(400).json({ message: 'Неверный пароль' });
+
+    // 👇👇👇 ТЕЛЕГРАМ УВЕДОМЛЕНИЕ (ВСТАВИТЬ СЮДА) 👇👇👇
+    const device = platform || 'Неизвестно';
+    sendToTelegram(`✅ <b>Вход в аккаунт</b>\n\n👤 Юзер: ${user.username}\n📧 Email: ${email}\n📱 Устройство: ${device}`);
+    // 👆👆👆
 
     const token = jwt.sign({ id: user._id, role: user.role }, process.env.JWT_SECRET || 'secret_key_change_this', { expiresIn: '30d' });
     res.json({ token, user: { id: user._id, username: user.username, email: user.email, role: user.role } });
@@ -378,7 +415,6 @@ app.post('/api/login', async (req, res) => {
     res.status(500).json({ message: 'Ошибка сервера' });
   }
 });
-
 // === ПОЛЬЗОВАТЕЛИ ===
 app.get('/api/users/me', authMiddleware, async (req, res) => {
   res.json(req.user);
