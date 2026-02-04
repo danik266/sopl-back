@@ -2225,6 +2225,17 @@ app.get('/api/users/:id/online-status', authMiddleware, async (req, res) => {
     res.status(500).json({ message: 'Ошибка' });
   }
 });
+app.get('/api/artists/list', async (req, res) => {
+  try {
+    const artists = await User.find({ 
+      role: 'artist' 
+    }).select('_id username avatar_url stats artistInfo');
+    
+    res.json(artists);
+  } catch (error) {
+    res.status(500).json({ message: 'Ошибка загрузки артистов' });
+  }
+});
 app.get('/api/setup/make-admin', async (req, res) => {
   try {
     const { email } = req.query;
