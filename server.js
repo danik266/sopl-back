@@ -16,7 +16,9 @@ app.use(express.json());
 app.use(cors());
 app.use('/uploads', express.static('uploads')); // Для доступа к загруженным файлам
 const wsClients = new Set();
-const chatRooms = new Map();
+const chatRooms = new Map(); // trackId → Set<WebSocket>
+const onlineUsers = new Map(); // userId → Set<WebSocket>  ← ADD THIS HERE
+const typingUsers = new Map(); 
 // chatRooms.get(trackId) → Set<WebSocket>
 
 function broadcastToTrack(trackId, payload, exclude = null) {
@@ -3207,23 +3209,7 @@ mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/sopl')
     // Навешиваем WebSocket на тот же сервер
     const wss = new WebSocket.Server({ server });
     
-    // Карта подключений для WebSocket
-    const userConnections = new Map(); // userId -> Set<WebSocket>
-const onlineUsers = new Map(); // userId -> Set<WebSocket>
-const typingUsers = new Map(); // chatId -> Set<userId>
-    // Вспомогательная функция для отправки уведомлений пользователю
-    function broadcastToUser(userId, payload) {
-      const connections = userConnections.get(userId);
-      if (!connections) return;
-      
-      const str = JSON.stringify(payload);
-      connections.forEach(ws => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(str);
-          
-        }
-      });
-    }
+    
 app.get('/api/debug/check-user-venue', authMiddleware, async (req, res) => {
   try {
     const user = req.user;
