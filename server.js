@@ -3137,13 +3137,9 @@ app.get('/api/tracks/:id/listeners', async (req, res) => {
 // === ГЛАВНАЯ ===
 app.get('/', (req, res) => {
   res.send(`
-    <h1>🚀 SOPL Backend v3.0</h1>
+    <h1>🚀 SOPL Backend</h1>
     <p>Сервер работает!</p>
     <h3>Полезные ссылки:</h3>
-    <ul>
-      <li><a href="/api/seed">Загрузить тестовые данные</a></li>
-      <li><a href="/api/setup/make-admin?email=твой@email.com">Сделать себя админом</a></li>
-    </ul>
   `);
 });
 
