@@ -36,3 +36,6 @@ Desktop.ini
 # Временные файлы
 tmp/
 temp/
+
+# Expo local state
+.expo/

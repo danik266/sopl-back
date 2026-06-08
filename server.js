@@ -16,6 +16,16 @@ const axios = require('axios');
 app.use(express.json());
 app.use(cors());
 app.use('/uploads', express.static('uploads')); // Для доступа к загруженным файлам
+
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'sopl-backend',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+  });
+});
+
 const wsClients = new Set();
 const chatRooms = new Map(); // trackId → Set<WebSocket>
 const onlineUsers = new Map(); // userId → Set<WebSocket>  ← ADD THIS HERE
@@ -105,17 +115,20 @@ const sendToTelegram = async (message) => {
     console.error('Ошибка отправки в Telegram:', error.message);
   }
 };
-const s3 = new S3Client({
-  region: process.env.AWS_REGION, // например 'eu-central-1'
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-  },
-});
+const fs = require('fs');
 
-// 2. НАСТРОЙКА MULTER (ТЕПЕРЬ ГРУЗИМ В S3, А НЕ В ПАПКУ)
-const upload = multer({
-  storage: multerS3({
+let storage;
+
+if (process.env.AWS_BUCKET_NAME) {
+  const s3 = new S3Client({
+    region: process.env.AWS_REGION, // например 'eu-central-1'
+    credentials: {
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    },
+  });
+
+  storage = multerS3({
     s3: s3,
     bucket: process.env.AWS_BUCKET_NAME, // Имя твоего бакета
     metadata: function (req, file, cb) {
@@ -126,8 +139,80 @@ const upload = multer({
       const folder = file.fieldname === 'audio' ? 'music/' : 'covers/';
       cb(null, folder + Date.now().toString() + '-' + file.originalname);
     }
-  })
-});
+  });
+} else {
+  console.warn('⚠️ AWS_BUCKET_NAME не задан в .env. Используется локальное хранилище в папке /uploads.');
+  
+  // Создаем папку uploads, если её нет
+  if (!fs.existsSync('uploads')) {
+    fs.mkdirSync('uploads', { recursive: true });
+  }
+  if (!fs.existsSync('uploads/music')) {
+    fs.mkdirSync('uploads/music', { recursive: true });
+  }
+  if (!fs.existsSync('uploads/covers')) {
+    fs.mkdirSync('uploads/covers', { recursive: true });
+  }
+
+  storage = multer.diskStorage({
+    destination: function (req, file, cb) {
+      const folder = file.fieldname === 'audio' ? 'uploads/music' : 'uploads/covers';
+      cb(null, folder);
+    },
+    filename: function (req, file, cb) {
+      cb(null, Date.now().toString() + '-' + file.originalname);
+    }
+  });
+}
+
+const upload = multer({ storage: storage });
+
+// Обертка для multer-middleware, чтобы автоматически добавлять поле .location при локальной загрузке
+const wrapper = (fn) => {
+  return (req, res, next) => {
+    fn(req, res, (err) => {
+      if (err) return next(err);
+      
+      const host = req.get('host');
+      const protocol = req.protocol;
+      const processFile = (file) => {
+        if (file && !file.location && file.path) {
+          // Заменяем обратные слэши для Windows на прямые
+          file.location = `${protocol}://${host}/${file.path.replace(/\\/g, '/')}`;
+        }
+      };
+
+      if (req.file) {
+        processFile(req.file);
+      }
+      if (req.files) {
+        if (Array.isArray(req.files)) {
+          req.files.forEach(processFile);
+        } else {
+          Object.keys(req.files).forEach(key => {
+            req.files[key].forEach(processFile);
+          });
+        }
+      }
+      next();
+    });
+  };
+};
+
+const originalSingle = upload.single;
+upload.single = function(...args) {
+  return wrapper(originalSingle.apply(upload, args));
+};
+
+const originalFields = upload.fields;
+upload.fields = function(...args) {
+  return wrapper(originalFields.apply(upload, args));
+};
+
+const originalArray = upload.array;
+upload.array = function(...args) {
+  return wrapper(originalArray.apply(upload, args));
+};
 // ============================================
 // СХЕМЫ ДАННЫХ (MongoDB Models)
 // ============================================
@@ -172,6 +257,10 @@ const UserSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 
+// Индексы для быстрого поиска
+UserSchema.index({ email: 1 });
+UserSchema.index({ role: 1, 'stats.followers': -1 });
+
 const User = mongoose.model('User', UserSchema);
 
 // 2. ТРЕК
@@ -193,6 +282,12 @@ const TrackSchema = new mongoose.Schema({
   uploadedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, // Кто загрузил
   createdAt: { type: Date, default: Date.now }
 });
+
+// Индексы для поиска и сортировки
+TrackSchema.index({ isApproved: 1, likes: -1, playCount: -1 });
+TrackSchema.index({ title: 'text', artist: 'text' });
+TrackSchema.index({ artistId: 1 });
+TrackSchema.index({ uploadedBy: 1, isApproved: 1 });
 
 const Track = mongoose.model('Track', TrackSchema);
 
@@ -253,6 +348,9 @@ const QueueSchema = new mongoose.Schema({
   completed_at: Date
 });
 
+// Индексы для быстрой загрузки очереди
+QueueSchema.index({ venue_id: 1, status: 1, created_at: 1 });
+
 const Queue = mongoose.model('Queue', QueueSchema);
 
 // 5. АКТИВНОСТЬ В ЛЕНТЕ
@@ -286,6 +384,11 @@ const FeedActivitySchema = new mongoose.Schema({
   comments: { type: Number, default: 0 },
   timestamp: { type: Date, default: Date.now }
 });
+
+// Индексы для ленты
+FeedActivitySchema.index({ timestamp: -1 });
+FeedActivitySchema.index({ user_id: 1, timestamp: -1 });
+FeedActivitySchema.index({ type: 1, timestamp: -1 });
 
 const FeedActivity = mongoose.model('FeedActivity', FeedActivitySchema);
 
@@ -335,7 +438,9 @@ const authMiddleware = async (req, res, next) => {
     if (!token) return res.status(401).json({ message: 'Не авторизован' });
     
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret_key_change_this');
-    req.user = await User.findById(decoded.id);
+    req.user = await User.findById(decoded.id)
+      .select('-password -likedTracks');
+    if (!req.user) return res.status(401).json({ message: 'Пользователь не найден' });
     next();
   } catch (error) {
     res.status(401).json({ message: 'Невалидный токен' });
@@ -458,7 +563,7 @@ app.put('/api/users/me', authMiddleware, upload.single('avatar'), async (req, re
 });
 app.get('/api/feed', optionalAuthMiddleware, async (req, res) => { 
   try {
-    const { category = 'all', page = 1, limit = 100 } = req.query;
+    const { category = 'all', page = 1, limit = 20 } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
     let query = {};
@@ -797,35 +902,47 @@ function formatFollowers(num) {
 
 // Замени эндпоинт /api/search/trending
 
+// Кэш для trending (обновляется раз в 60 секунд)
+let trendingCache = null;
+let trendingCacheTime = 0;
+const TRENDING_CACHE_TTL = 60 * 1000; // 60 секунд
+
 app.get('/api/search/trending', optionalAuthMiddleware, async (req, res) => {
   try {
-    // 🔥 ТОП-10 ТРЕКОВ (было топ-бесконечность)
-    const topTracks = await Track.find({ isApproved: true })
-      .sort({ likes: -1, playCount: -1 })
-      .limit(10); // ОГРАНИЧИЛИ ДО 10
+    const now = Date.now();
+    if (trendingCache && (now - trendingCacheTime) < TRENDING_CACHE_TTL) {
+      return res.json(trendingCache);
+    }
 
-    // Топ-5 артистов с форматированием подписчиков
-    const topArtists = await User.find({ 
-        role: { $in: ['artist', 'user'] },
-        'stats.followers': { $gt: 0 }
-      })
-      .sort({ 'stats.followers': -1 })
-      .limit(5)
-      .select('username avatar_url isVerified stats role');
+    const [topTracks, topArtists] = await Promise.all([
+      Track.find({ isApproved: true })
+        .sort({ likes: -1, playCount: -1 })
+        .limit(10)
+        .select('title artist cover duration genre likes playCount audioUrl artistId')
+        .lean(),
+      User.find({ 
+          role: { $in: ['artist', 'user'] },
+          'stats.followers': { $gt: 0 }
+        })
+        .sort({ 'stats.followers': -1 })
+        .limit(5)
+        .select('username avatar_url isVerified stats role')
+        .lean()
+    ]);
 
-    // 🔥 ФОРМАТИРУЕМ подписчиков для каждого артиста
     const formattedArtists = topArtists.map(artist => ({
-      ...artist.toObject(),
+      ...artist,
       stats: {
         ...artist.stats,
-        followersFormatted: formatFollowers(artist.stats.followers) // Добавляем форматированное поле
+        followersFormatted: formatFollowers(artist.stats?.followers)
       }
     }));
 
-    res.json({
-      tracks: topTracks,
-      artists: formattedArtists
-    });
+    const result = { tracks: topTracks, artists: formattedArtists };
+    trendingCache = result;
+    trendingCacheTime = now;
+
+    res.json(result);
   } catch (error) {
     console.error('Ошибка загрузки трендов:', error);
     res.status(500).json({ message: 'Ошибка загрузки трендов' });
@@ -837,31 +954,14 @@ app.get('/api/users/:id/is-following', authMiddleware, async (req, res) => {
     const targetUserId = req.params.id;
     const currentUserId = req.user._id.toString();
     
-    console.log('🔍 === is-following check ===');
-    console.log('  Current user ID:', currentUserId);
-    console.log('  Target user ID:', targetUserId);
-    
-    const currentUser = await User.findById(req.user._id);
-    
-    if (!currentUser) {
-      console.error('❌ Current user not found!');
-      return res.status(404).json({ message: 'Текущий пользователь не найден' });
-    }
-    
-    const isFollowing = currentUser.following
+    const isFollowing = (req.user.following || [])
       .map(id => id.toString())
       .includes(targetUserId);
     
     const isOwn = currentUserId === targetUserId;
     
-    console.log('  Is own profile?', isOwn);
-    console.log('  Is following?', isFollowing);
-    console.log('  Following array:', currentUser.following.map(id => id.toString()));
-    console.log('=========================');
-    
     res.json({ isFollowing, isOwn });
   } catch (error) {
-    console.error('💥 Error in is-following:', error);
     res.status(500).json({ message: 'Ошибка сервера' });
   }
 });
@@ -1649,26 +1749,27 @@ app.patch('/api/queue/:id/status', authMiddleware, adminMiddleware, async (req, 
     const updatedQueue = await Queue
       .find({ venue_id: venueId, status: { $ne: 'completed' } })
       .sort({ created_at: 1 })
-      .populate('track_id');
+      .populate('track_id')
+      .populate('user_id', 'username avatar_url');
 
     broadcastToVenue(venueId, { 
-  type: 'queue_update', 
-  queue: fullQueue.map(q => ({
-    _id: q._id,
-    status: q.status,
-    track: {
-      title: q.track_id.title,     // ← Название
-      artist: q.track_id.artist,   // ← Артист
-      cover: q.track_id.cover,     // ← Обложка
-      audioUrl: q.track_id.audioUrl // ← Ссылка на аудио
-    },
-    user: {
-      username: q.user_id.username,
-      avatar_url: q.user_id.avatar_url
-    },
-    created_at: q.created_at
-  }))
-});
+      type: 'queue_update', 
+      queue: updatedQueue.map(q => ({
+        _id: q._id,
+        status: q.status,
+        track: q.track_id ? {
+          title: q.track_id.title,
+          artist: q.track_id.artist,
+          cover: q.track_id.cover,
+          audioUrl: q.track_id.audioUrl
+        } : null,
+        user: q.user_id ? {
+          username: q.user_id.username,
+          avatar_url: q.user_id.avatar_url
+        } : null,
+        created_at: q.created_at
+      }))
+    });
 
     res.json(queueItem);
   } catch (error) {
@@ -2084,18 +2185,20 @@ app.post('/api/admin/venues', authMiddleware, adminMiddleware, async (req, res) 
     const { v4: uuidv4 } = require('uuid'); // Добавь в начало файла если нет
     const venueId = uuidv4();
     const slug = name.toLowerCase().replace(/[^a-z0-9а-яё\s]/g, '').trim().replace(/\s+/g, '-');
-const qrCode = `SOPL_venue_${slug}_${venue._id}`;
 
-    // Создаём заведение
+    // Создаём заведение с временным qr_code
     const venue = new Venue({
-  name,
-  address,
-  hours,
-  photo_url: photo_url || undefined,
-  qr_code: qrCode, // Старый формат
-  // venue_id: venueId, // Удали эту строку
-  ownerUserId: owner._id,
-});
+      name,
+      address,
+      hours,
+      photo_url: photo_url || undefined,
+      qr_code: 'tmp_' + Date.now(),
+      ownerUserId: owner._id,
+    });
+    await venue.save();
+
+    // Теперь обновляем qr_code с реальным _id
+    venue.qr_code = `SOPL_venue_${slug}_${venue._id}`;
     await venue.save();
 
     // Обновляем юзера: роль venue_admin + ссылка на заведение
